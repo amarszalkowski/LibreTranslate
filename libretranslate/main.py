@@ -155,11 +155,24 @@ def get_args():
         help="Shared storage URI to use for multi-process data sharing (e.g. via gunicorn)",
     )
     parser.add_argument(
+        "--secondary",
+        default=DEFARGS['SECONDARY'],
+        action="store_true",
+        help="Mark this instance as a secondary instance to avoid conflicts with the primary node in multi-node setups",
+    )
+    parser.add_argument(
         "--load-only",
         type=operator.methodcaller("split", ","),
         default=DEFARGS['LOAD_ONLY'],
         metavar="<comma-separated language codes>",
         help="Set available languages (ar,de,en,es,fr,ga,hi,it,ja,ko,pt,ru,zh)",
+    )
+    parser.add_argument(
+        "--alternatives-limit",
+        default=DEFARGS['ALTERNATIVES_LIMIT'],
+        type=int,
+        metavar="<maximum number of alternatives translations>",
+        help="Set the maximum number of supported alternative translations (%(default)s)",
     )
     parser.add_argument(
         "--threads",

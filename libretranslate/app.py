@@ -11,7 +11,7 @@ from timeit import default_timer
 
 import argostranslatefiles
 from argostranslatefiles import get_supported_formats
-from flask import Blueprint, Flask, Response, abort, jsonify, render_template, request, send_file, session, url_for
+from flask import Blueprint, Flask, Response, abort, jsonify, render_template, request, send_file, session, url_for, make_response
 from flask_babel import Babel
 from flask_session import Session
 from flask_swagger import swagger
@@ -148,6 +148,10 @@ def get_routes_limits(args, api_keys_db):
 
     return res
 
+def filter_unique(seq, extra):
+    seen = set({extra, ""})
+    seen_add = seen.add
+    return [x for x in seq if not (x in seen or seen_add(x))]
 
 def create_app(args):
     from libretranslate.init import boot
@@ -234,7 +238,8 @@ def create_app(args):
             ),
             storage_uri=args.req_limit_storage,
             default_limits_deduct_when=lambda req: True, # Force cost to be called after the request
-            default_limits_cost=limits_cost
+            default_limits_cost=limits_cost,
+            strategy="moving-window",
         )
     else:
         from .no_limiter import Limiter
@@ -302,11 +307,18 @@ def create_app(args):
                   ):
                     need_key = True
 
+                  req_secret = get_req_secret()
                   if (args.require_api_key_secret
                     and key_missing
-                    and not secret.secret_match(get_req_secret())
+                    and not secret.secret_match(req_secret)
                   ):
                     need_key = True
+                    if secret.secret_bogus_match(req_secret):
+                      abort(make_response(jsonify({
+                        'translatedText': secret.get_emoji(),
+                        'alternatives': [],
+                        'detectedLanguage': { 'confidence': 100, 'language': 'en' }
+                      }), 200))
 
                   if need_key:
                     description = _("Please contact the server operator to get an API key")
@@ -374,7 +386,7 @@ def create_app(args):
         if langcode and langcode in get_available_locale_codes(not args.debug):
             session.update(preferred_lang=langcode)
 
-        return render_template(
+        resp = make_response(render_template(
             "index.html",
             gaId=args.ga_id,
             frontendTimeout=args.frontend_timeout,
@@ -386,18 +398,34 @@ def create_app(args):
             available_locales=[{'code': l['code'], 'name': _lazy(l['name'])} for l in get_available_locales(not args.debug)],
             current_locale=get_locale(),
             alternate_locales=get_alternate_locale_links()
-        )
+        ))
+
+        if args.require_api_key_secret:
+          resp.set_cookie('r', '1')
+
+        return resp
 
     @bp.route("/js/app.js")
     @limiter.exempt
     def appjs():
       if args.disable_web_ui:
-            abort(404)
+        abort(404)
 
+      api_secret = ""
+      bogus_api_secret = ""
+      if args.require_api_key_secret:
+        bogus_api_secret = secret.get_bogus_secret_b64()
+
+        if 'User-Agent' in request.headers and request.cookies.get('r'):
+          api_secret = secret.get_current_secret_js()
+        else:
+          api_secret = secret.get_bogus_secret_js()
+        
       response = Response(render_template("app.js.template",
             url_prefix=args.url_prefix,
             get_api_key_link=args.get_api_key_link,
-            api_secret=secret.get_current_secret() if args.require_api_key_secret else ""), content_type='application/javascript; charset=utf-8')
+            api_secret=api_secret,
+            bogus_api_secret=bogus_api_secret), content_type='application/javascript; charset=utf-8')
 
       if args.require_api_key_secret:
         response.headers['Last-Modified'] = http_date(datetime.now())
@@ -497,6 +525,14 @@ def create_app(args):
                * `text` - Plain text
                * `html` - HTML markup
           - in: formData
+            name: alternatives
+            schema:
+              type: integer
+              default: 0
+              example: 3
+            required: false
+            description: Preferred number of alternative translations 
+          - in: formData
             name: api_key
             schema:
               type: string
@@ -558,11 +594,13 @@ def create_app(args):
             source_lang = json.get("source")
             target_lang = json.get("target")
             text_format = json.get("format")
+            num_alternatives = int(json.get("alternatives", 0))
         else:
             q = request.values.get("q")
             source_lang = request.values.get("source")
             target_lang = request.values.get("target")
             text_format = request.values.get("format")
+            num_alternatives = request.values.get("alternatives", 0)
 
         if not q:
             abort(400, description=_("Invalid request: missing %(name)s parameter", name='q'))
@@ -570,6 +608,14 @@ def create_app(args):
             abort(400, description=_("Invalid request: missing %(name)s parameter", name='source'))
         if not target_lang:
             abort(400, description=_("Invalid request: missing %(name)s parameter", name='target'))
+        
+        try:
+            num_alternatives = max(0, int(num_alternatives))
+        except ValueError:
+            abort(400, description=_("Invalid request: %(name)s parameter is not a number", name='alternatives'))
+
+        if args.alternatives_limit != -1 and num_alternatives > args.alternatives_limit:
+            abort(400, description=_("Invalid request: %(name)s parameter must be <= %(value)s", name='alternatives', value=args.alternatives_limit))
 
         if not request.is_json:
             # Normalize line endings to UNIX style (LF) only so we can consistently
@@ -626,54 +672,53 @@ def create_app(args):
 
         try:
             if batch:
-                results = []
+                batch_results = []
+                batch_alternatives = []
                 for text in q:
                     translator = src_lang.get_translation(tgt_lang)
                     if translator is None:
                         abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_lang.name), scode=src_lang.code))
 
                     if text_format == "html":
-                        translated_text = str(translate_html(translator, text))
+                        translated_text = unescape(str(translate_html(translator, text)))
+                        alternatives = [] # Not supported for html yet
                     else:
-                        translated_text = improve_translation_formatting(text, translator.translate(text))
+                        hypotheses = translator.hypotheses(text, num_alternatives + 1)
+                        translated_text = unescape(improve_translation_formatting(text, hypotheses[0].value))
+                        alternatives = filter_unique([unescape(improve_translation_formatting(text, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
 
-                    results.append(unescape(translated_text))
+                    batch_results.append(translated_text)
+                    batch_alternatives.append(alternatives)
+                
+                result = {"translatedText": batch_results}
+
                 if source_lang == "auto":
-                    return jsonify(
-                        {
-                            "translatedText": results,
-                            "detectedLanguage": [detected_src_lang] * len(q)
-                        }
-                    )
-                else:
-                    return jsonify(
-                          {
-                            "translatedText": results
-                          }
-                    )
+                    result["detectedLanguage"] = [detected_src_lang] * len(q)
+                if num_alternatives > 0:
+                    result["alternatives"] = batch_alternatives
+
+                return jsonify(result)
             else:
                 translator = src_lang.get_translation(tgt_lang)
                 if translator is None:
                     abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_lang.name), scode=src_lang.code))
 
                 if text_format == "html":
-                    translated_text = str(translate_html(translator, q))
+                    translated_text = unescape(str(translate_html(translator, q)))
+                    alternatives = [] # Not supported for html yet
                 else:
-                    translated_text = improve_translation_formatting(q, translator.translate(q))
+                    hypotheses = translator.hypotheses(q, num_alternatives + 1)
+                    translated_text = unescape(improve_translation_formatting(q, hypotheses[0].value))
+                    alternatives = filter_unique([unescape(improve_translation_formatting(q, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
+
+                result = {"translatedText": translated_text}
 
                 if source_lang == "auto":
-                    return jsonify(
-                        {
-                            "translatedText": unescape(translated_text),
-                            "detectedLanguage": detected_src_lang
-                        }
-                    )
-                else:
-                    return jsonify(
-                        {
-                            "translatedText": unescape(translated_text)
-                        }
-                    )
+                    result["detectedLanguage"] = detected_src_lang
+                if num_alternatives > 0:
+                    result["alternatives"] = alternatives
+
+                return jsonify(result)
         except Exception as e:
             raise e
             abort(500, description=_("Cannot translate text: %(text)s", text=str(e)))
@@ -785,7 +830,7 @@ def create_app(args):
 
         src_lang = next(iter([l for l in languages if l.code == source_lang]), None)
 
-        if src_lang is None:
+        if src_lang is None and source_lang != "auto":
             abort(400, description=_("%(lang)s is not supported", lang=source_lang))
 
         tgt_lang = next(iter([l for l in languages if l.code == target_lang]), None)
@@ -806,6 +851,14 @@ def create_app(args):
             # each batch uses all available limits
             if char_limit > 0:
                 request.req_cost = max(1, int(os.path.getsize(filepath) / char_limit))
+
+            if source_lang == "auto":
+                src_texts = argostranslatefiles.get_texts(filepath)
+                candidate_langs = detect_languages(src_texts)
+                detected_src_lang = candidate_langs[0]
+                src_lang = next(iter([l for l in languages if l.code == detected_src_lang["language"]]), None)
+                if src_lang is None:
+                    abort(400, description=_("%(lang)s is not supported", lang=detected_src_lang["language"]))
 
             translated_file_path = argostranslatefiles.translate_file(src_lang.get_translation(tgt_lang), filepath)
             translated_filename = os.path.basename(translated_file_path)
